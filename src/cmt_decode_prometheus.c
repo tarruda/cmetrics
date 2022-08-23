@@ -888,8 +888,11 @@ static int finish_duplicate_histogram_summary_sum_count(
     }
 
     if (type == CMT_DECODE_PROMETHEUS_CONTEXT_SAMPLE_TYPE_COUNT) {
+        /* trim `_count` from the end of the metric name */
         metric_name[cmt_sds_len(metric_name) - 6] = 0;
-    } else {
+    }
+    else {
+        /* trim `_sum` from the end of the metric name */
         metric_name[cmt_sds_len(metric_name) - 4] = 0;
     }
 
