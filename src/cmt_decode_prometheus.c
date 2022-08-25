@@ -17,8 +17,6 @@
  *  limitations under the License.
  */
 
-#include "cmetrics/cmt_histogram.h"
-#include "cmetrics/cmt_summary.h"
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
@@ -37,7 +35,8 @@
 #include <stdio.h>
 #include <string.h>
 
-static void reset_context(struct cmt_decode_prometheus_context *context)
+static void reset_context(struct cmt_decode_prometheus_context *context,
+                          bool reset_summary)
 {
     int i;
     struct cmt_decode_prometheus_context_sample *sample;
@@ -69,6 +68,9 @@ static void reset_context(struct cmt_decode_prometheus_context *context)
 
     cmt_sds_destroy(context->strbuf);
     context->strbuf = NULL;
+    if (reset_summary) {
+        context->current.summary = NULL;
+    }
     cmt_sds_destroy(context->metric.name_orig);
     cmt_sds_destroy(context->metric.docstring);
     memset(&context->metric,
@@ -122,7 +124,7 @@ int cmt_decode_prometheus_create(
         if (context.errcode) {
             result = context.errcode;
         }
-        reset_context(&context);
+        reset_context(&context, true);
     }
 
     cmt_decode_prometheus__delete_buffer(buf, scanner);
@@ -592,20 +594,25 @@ static int add_metric_histogram(struct cmt_decode_prometheus_context *context)
         goto end;
     }
 
-    h = cmt_histogram_create(context->cmt,
-            context->metric.ns,
-            context->metric.subsystem,
-            context->metric.name,
-            get_docstring(context),
-            cmt_buckets,
-            label_i,
-            label_i ? labels_without_le : NULL);
-
+    h = context->current.histogram;
     if (!h) {
-        ret = report_error(context,
-                CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
-                "cmt_histogram_create failed");
-        goto end;
+        h = cmt_histogram_create(context->cmt,
+                context->metric.ns,
+                context->metric.subsystem,
+                context->metric.name,
+                get_docstring(context),
+                cmt_buckets,
+                label_i,
+                label_i ? labels_without_le : NULL);
+
+        if (!h) {
+            ret = report_error(context,
+                    CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
+                    "cmt_histogram_create failed");
+            goto end;
+        }
+
+        context->current.histogram = h;
     }
 
     if (cmt_histogram_set_default(h, 0, bucket_defaults, sum, count,
@@ -794,21 +801,26 @@ static int add_metric_summary(struct cmt_decode_prometheus_context *context)
         timestamp = context->opts.default_timestamp;
     }
 
-    s = cmt_summary_create(context->cmt,
-            context->metric.ns,
-            context->metric.subsystem,
-            context->metric.name,
-            get_docstring(context),
-            quantile_count,
-            quantiles,
-            label_i,
-            label_i ? labels_without_quantile : NULL);
-
+    s = context->current.summary;
     if (!s) {
-        ret = report_error(context,
-                CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
-                "cmt_summary_create failed");
-        goto end;
+        s = cmt_summary_create(context->cmt,
+                context->metric.ns,
+                context->metric.subsystem,
+                context->metric.name,
+                get_docstring(context),
+                quantile_count,
+                quantiles,
+                label_i,
+                label_i ? labels_without_quantile : NULL);
+
+        if (!s) {
+            ret = report_error(context,
+                    CMT_DECODE_PROMETHEUS_CMT_CREATE_ERROR,
+                    "cmt_summary_create failed");
+            goto end;
+        }
+
+        context->current.summary = s;
     }
 
     if (cmt_summary_set_default(s, timestamp, quantile_defaults, sum, count,
@@ -837,7 +849,8 @@ end:
     return ret;
 }
 
-static int finish_metric(struct cmt_decode_prometheus_context *context)
+static int finish_metric(struct cmt_decode_prometheus_context *context,
+                         bool reset_summary)
 {
     int rv = 0;
 
@@ -864,7 +877,7 @@ static int finish_metric(struct cmt_decode_prometheus_context *context)
     }
 
 end:
-    reset_context(context);
+    reset_context(context, reset_summary);
     return rv;
 }
 
@@ -881,7 +894,7 @@ static int finish_duplicate_histogram_summary_sum_count(
     current_metric_type = context->metric.type;
     current_metric_docstring = cmt_sds_create(context->metric.docstring);
 
-    rv = finish_metric(context);
+    rv = finish_metric(context, false);
     if (rv) {
         cmt_sds_destroy(current_metric_docstring);
         return rv;
@@ -917,12 +930,12 @@ static int parse_histogram_summary_name(
     if (current_name_len < parsed_name_len) {
         // current name length cannot be less than the length already parsed. That means
         // another metric has started
-        return finish_metric(context);
+        return finish_metric(context, true);
     }
 
     if (strncmp(context->metric.name_orig, metric_name, parsed_name_len)) {
         // the name prefix must be the same or we are starting a new metric
-        return finish_metric(context);
+        return finish_metric(context, true);
     }
     else if (parsed_name_len == current_name_len) {
         // parsing HELP after TYPE
@@ -974,7 +987,7 @@ static int parse_histogram_summary_name(
         context->metric.current_sample_type = CMT_DECODE_PROMETHEUS_CONTEXT_SAMPLE_TYPE_COUNT;
     } else {
         // invalid histogram/summary suffix, treat it as a different metric
-        return finish_metric(context);
+        return finish_metric(context, true);
     }
 
     // still in the same metric
@@ -1000,7 +1013,7 @@ static int parse_metric_name(
             }
             else {
                 // new metric name means the current metric is finished
-                ret = finish_metric(context);
+                ret = finish_metric(context, true);
             }
         }
         else {
